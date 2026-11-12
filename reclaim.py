@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import locale
 import os
 import re
 import shutil
@@ -21,6 +22,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+try:
+    import curses
+except ImportError:  # e.g. Windows without windows-curses; --dry-run still works
+    curses = None  # type: ignore[assignment]
 
 __version__ = "0.1.0"
 
@@ -881,6 +887,377 @@ def report_json(cats: List[Category], warnings: List[str]) -> dict:
     }
 
 
+# ---------------------------------------------------------------- picker (curses)
+
+
+KEYS_MAIN = "↑↓ move  space toggle  a all  → open  c clean  q quit"
+KEYS_CAT = "↑↓ move  space toggle  a all  s sort  ← back  c clean  q quit"
+SORTS = ("size", "age", "name")
+
+
+def toggle_items(items: List[Item], include_review: bool) -> None:
+    """Select every candidate, or clear all items if every candidate is already selected.
+
+    Candidates are selectable items; review items count only when include_review is set.
+    """
+    cands = [i for i in items if i.selectable and (include_review or i.status != REVIEW)]
+    if cands and not all(i.selected for i in cands):
+        for i in cands:
+            i.selected = True
+    else:
+        for i in items:
+            i.selected = False
+
+
+def toggle_category(c: Category) -> str:
+    """Space on a category: toggles its safe items. Returns a message when there is nothing to toggle."""
+    if not any(i.selectable and i.status != REVIEW for i in c.items):
+        if any(i.status == REVIEW for i in c.items):
+            return "review items: open the category and pick them one by one"
+        return "nothing selectable here"
+    toggle_items(c.items, include_review=False)
+    return ""
+
+
+def fit(text: str, width: int) -> str:
+    """Shorten text to width, keeping the end (paths are most telling at the end)."""
+    if width <= 1:
+        return ""
+    return text if len(text) <= width else "…" + text[-(width - 1):]
+
+
+class Tui:
+    def __init__(self, scr, cats: List[Category], cfg: Config) -> None:
+        self.scr, self.cats, self.cfg = scr, cats, cfg
+        self.cat: Optional[Category] = None
+        self.main_pos = self.item_pos = self.top = 0
+        self.sort = "size"
+        self.msg = ""
+        self.log: List[Result] = []
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        scr.keypad(True)
+        self.a_sel, self.a_review, self.a_prot = curses.A_BOLD, curses.A_NORMAL, curses.A_DIM
+        if curses.has_colors():
+            curses.start_color()
+            bg = -1
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            curses.init_pair(1, curses.COLOR_GREEN, bg)
+            curses.init_pair(2, curses.COLOR_YELLOW, bg)
+            curses.init_pair(3, curses.COLOR_RED, bg)
+            self.a_sel = curses.color_pair(1) | curses.A_BOLD
+            self.a_review = curses.color_pair(2)
+            self.a_prot = curses.color_pair(3)
+
+    # -- state
+
+    def rows(self) -> list:
+        return self.cat.items if self.cat else self.cats
+
+    def get_pos(self) -> int:
+        return self.item_pos if self.cat else self.main_pos
+
+    def set_pos(self, v: int) -> None:
+        n = len(self.rows())
+        v = max(0, min(v, n - 1)) if n else 0
+        if self.cat:
+            self.item_pos = v
+        else:
+            self.main_pos = v
+
+    def list_height(self) -> int:
+        return max(1, self.scr.getmaxyx()[0] - 6)
+
+    # -- drawing
+
+    def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            try:
+                self.scr.addnstr(y, x, text, w - x - (1 if y == h - 1 else 0), attr)
+            except curses.error:
+                pass
+
+    def cat_line(self, c: Category) -> Tuple[str, int]:
+        sel = [i for i in c.items if i.selected]
+        selectable = [i for i in c.items if i.selectable]
+        box = "[x]" if sel and len(sel) == len(selectable) else "[-]" if sel else "[ ]"
+        n_prot = len(c.items) - len(selectable)
+        n_rev = sum(1 for i in c.items if i.status == REVIEW)
+        flags = ", ".join(f for f in (f"{n_prot} protected" if n_prot else "",
+                                      f"{n_rev} to review" if n_rev else "") if f)
+        total = human(c.total()) if c.size_known() else "?"
+        text = (f" {box} {c.title:<30.30} {len(c.items):>5}  {total:>8}"
+                f"   sel {human(c.selected_size()):>8}   {flags}")
+        attr = self.a_sel if sel else (self.a_review if n_rev and n_rev == len(c.items) else 0)
+        return text, attr
+
+    def item_line(self, i: Item, w: int, now: float) -> Tuple[str, int]:
+        box = "[x]" if i.selected else "[ ]"
+        head = f" {box} {human(i.size):>8} {age(i.last_used, now):>6}  {i.note[:24]:<24}  "
+        text = head + fit(i.label, max(1, w - len(head) - 1))
+        if i.selected:
+            attr = self.a_sel
+        elif i.status == REVIEW:
+            attr = self.a_review
+        elif i.status == PROTECTED:
+            attr = self.a_prot
+        else:
+            attr = 0
+        return text, attr
+
+    def detail(self) -> str:
+        rows = self.rows()
+        if not rows:
+            return ""
+        row = rows[self.get_pos()]
+        if self.cat:
+            return f"{row.status}: {row.note}  ·  {row.action()}" if row.note else f"{row.status}: {row.action()}"
+        return row.hint
+
+    def draw(self) -> None:
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 10 or w < 60:
+            self.put(0, 0, "terminal too small (need 60x10)")
+            scr.refresh()
+            return
+        sel = selected_items(self.cats)
+        self.put(0, 0, f" {headline()}   selected {human(sum_size(sel))} in {len(sel)} item(s)".ljust(w),
+                 curses.A_REVERSE | curses.A_BOLD)
+        if self.cat:
+            self.put(1, 1, f"{self.cat.title}   sorted by {self.sort}", curses.A_BOLD)
+            self.put(2, 1, fit(self.cat.hint, w - 2), curses.A_DIM)
+        else:
+            self.put(1, 1, "what can go", curses.A_BOLD)
+            self.put(2, 1, fit("space on a category selects its safe items; review items are picked inside it",
+                               w - 2), curses.A_DIM)
+        rows, lh, pos = self.rows(), self.list_height(), self.get_pos()
+        if pos < self.top:
+            self.top = pos
+        elif pos >= self.top + lh:
+            self.top = pos - lh + 1
+        self.top = max(0, min(self.top, max(0, len(rows) - lh)))
+        if len(rows) > lh:
+            span = f"{self.top + 1}-{min(len(rows), self.top + lh)} of {len(rows)}"
+            self.put(1, max(1, w - len(span) - 2), span, curses.A_DIM)
+        if not rows:
+            self.put(3, 2, "nothing left here", curses.A_DIM)
+        now = time.time()
+        for n, row in enumerate(rows[self.top:self.top + lh]):
+            text, attr = self.item_line(row, w, now) if self.cat else self.cat_line(row)
+            if self.top + n == pos:
+                attr |= curses.A_REVERSE
+            self.put(3 + n, 0, text.ljust(w), attr)
+        self.put(h - 3, 0, "─" * w, curses.A_DIM)
+        self.put(h - 2, 1, fit(self.msg or self.detail(), w - 2), curses.A_BOLD if self.msg else 0)
+        self.put(h - 1, 1, KEYS_CAT if self.cat else KEYS_MAIN, curses.A_DIM)
+        scr.refresh()
+
+    def dialog(self, title: str, lines: List[str], prompt: str) -> int:
+        h, w = self.scr.getmaxyx()
+        bw = max(10, min(w - 2, max([len(title) + 6, len(prompt) + 4] + [len(x) + 4 for x in lines])))
+        body = max(1, min(len(lines), h - 7))
+        bh = body + 5
+        win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+        win.keypad(True)
+        shown = lines if len(lines) <= body else lines[:body - 1] + [f"… {len(lines) - body + 1} more"]
+        try:
+            win.box()
+            win.addnstr(0, 2, f" {title} ", bw - 4, curses.A_BOLD)
+            for n, line in enumerate(shown):
+                win.addnstr(2 + n, 2, line, bw - 4)
+            win.addnstr(bh - 2, 2, prompt, bw - 4, curses.A_BOLD)
+        except curses.error:
+            pass
+        win.refresh()
+        key = win.getch()
+        del win
+        self.scr.touchwin()
+        return key
+
+    def progress(self, n: int, total: int, item: Item) -> None:
+        h, w = self.scr.getmaxyx()
+        self.put(h - 2, 0, " " * (w - 1))
+        self.put(h - 2, 1, fit(f"cleaning {n}/{total}: {item.label}", w - 2), curses.A_BOLD)
+        self.scr.refresh()
+
+    # -- actions
+
+    def toggle(self) -> None:
+        rows = self.rows()
+        if not rows:
+            return
+        row = rows[self.get_pos()]
+        if not self.cat:
+            self.toggle_category(row)
+            return
+        if not row.selectable:
+            self.msg = f"protected: {row.note}"
+            return
+        row.selected = not row.selected
+        self.set_pos(self.get_pos() + 1)
+
+    def toggle_category(self, c: Category) -> None:
+        self.msg = toggle_category(c)
+
+    def toggle_all(self) -> None:
+        if self.cat:
+            toggle_items(self.cat.items, include_review=True)
+        else:
+            toggle_items([i for c in self.cats for i in c.items], include_review=False)
+
+    def apply_sort(self) -> None:
+        if not self.cat:
+            return
+        if self.sort == "size":
+            self.cat.items.sort(key=lambda i: i.size, reverse=True)
+        elif self.sort == "age":
+            self.cat.items.sort(key=lambda i: i.last_used or float("inf"))
+        else:
+            self.cat.items.sort(key=lambda i: i.label.lower())
+
+    def cycle_sort(self) -> None:
+        rows = self.rows()
+        cur = rows[self.get_pos()] if rows else None
+        self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+        self.apply_sort()
+        if cur is not None and self.cat:
+            self.set_pos(next(n for n, i in enumerate(self.cat.items) if i is cur))
+
+    def open(self) -> None:
+        if self.cat or not self.cats:
+            return
+        self.cat = self.cats[self.main_pos]
+        self.item_pos = self.top = 0
+        self.apply_sort()
+
+    def back(self) -> None:
+        if not self.cat:
+            return
+        prev, self.cat, self.top = self.cat, None, 0
+        self.set_pos(next((n for n, c in enumerate(self.cats) if c is prev), self.main_pos))
+
+    def clean(self) -> None:
+        sel = selected_items(self.cats)
+        if not sel:
+            self.msg = "nothing selected"
+            return
+        lines = []
+        for c in self.cats:
+            s = [i for i in c.items if i.selected and i.selectable]
+            if s:
+                lines.append(f"{c.title}: {len(s)} item(s), {human(sum_size(s))}")
+        cmds = sorted({i.action() for i in sel if i.command})
+        if cmds:
+            lines += ["", "runs:"] + [f"  {x}" for x in cmds[:8]]
+            if len(cmds) > 8:
+                lines.append(f"  … {len(cmds) - 8} more")
+        n_rm = sum(1 for i in sel if not i.command)
+        if n_rm:
+            lines += ["", f"deletes {n_rm} folder(s)/file(s) for good (not to the Trash)"]
+        key = self.dialog("clean up", lines,
+                          f"clean {len(sel)} item(s), {human(sum_size(sel))}?  y = yes, any other key = no")
+        if key not in (ord("y"), ord("Y")):
+            self.msg = "cancelled, nothing deleted"
+            return
+        before = shutil.disk_usage(HOME).free
+        results = execute(sel, self.cfg, self.progress)
+        after = shutil.disk_usage(HOME).free
+        self.log += results
+        done = {id(x.item) for x in results if x.ok}
+        for c in self.cats:
+            c.items = [i for i in c.items if id(i) not in done]
+        self.cats = [c for c in self.cats if c.items]
+        if self.cat is not None and not any(c is self.cat for c in self.cats):
+            self.cat = None
+        self.set_pos(self.get_pos())
+        ok = [x for x in results if x.ok]
+        bad = [x for x in results if not x.ok]
+        est = sum_size([x.item for x in ok])
+        self.msg = f"cleaned {len(ok)}/{len(results)} (~{human(est)}); free space {human(before)} → {human(after)}"
+        if est and after - before < est // 2 and any(c.key == "tm-snapshots" for c in self.cats):
+            self.msg += "; local snapshots still hold the rest"
+        if bad:
+            lines = [f"{x.item.label}: {x.message}" for x in bad]
+            self.dialog(f"{len(bad)} item(s) not cleaned", lines, "any key to continue")
+
+    def loop(self) -> None:
+        while True:
+            self.draw()
+            k = self.scr.getch()
+            self.msg = ""
+            lh = self.list_height()
+            if k in (ord("q"), ord("Q")):
+                return
+            elif k in (curses.KEY_UP, ord("k")):
+                self.set_pos(self.get_pos() - 1)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.set_pos(self.get_pos() + 1)
+            elif k == curses.KEY_PPAGE:
+                self.set_pos(self.get_pos() - lh)
+            elif k == curses.KEY_NPAGE:
+                self.set_pos(self.get_pos() + lh)
+            elif k in (curses.KEY_HOME, ord("g")):
+                self.set_pos(0)
+            elif k in (curses.KEY_END, ord("G")):
+                self.set_pos(len(self.rows()) - 1)
+            elif k == ord(" "):
+                self.toggle()
+            elif k == ord("a"):
+                self.toggle_all()
+            elif k in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, 13, ord("l")):
+                self.open()
+            elif k in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, 27, ord("h")):
+                self.back()
+            elif k == ord("s") and self.cat:
+                self.cycle_sort()
+            elif k == ord("c"):
+                self.clean()
+
+
+def run_tui(cats: List[Category], cfg: Config) -> List[Result]:
+    os.environ.setdefault("ESCDELAY", "25")  # Esc goes back without a 1 s pause
+    locale.setlocale(locale.LC_ALL, "")
+    log: List[Result] = []
+
+    def body(scr) -> None:
+        tui = Tui(scr, cats, cfg)
+        try:
+            tui.loop()
+        finally:
+            log.extend(tui.log)
+
+    curses.wrapper(body)
+    return log
+
+
+def print_log(log: List[Result], out=None) -> None:
+    out = out or sys.stdout
+    ok = [x for x in log if x.ok]
+    print(f"cleaned {len(ok)} of {len(log)} item(s), about {human(sum_size([x.item for x in ok]))}", file=out)
+    for x in ok[:50]:
+        print(f"  ok   {x.item.action()}", file=out)
+    if len(ok) > 50:
+        print(f"  ... {len(ok) - 50} more", file=out)
+    for x in log:
+        if not x.ok:
+            print(f"  FAIL {x.item.label}: {x.message}", file=out)
+
+
+def ask(question: str) -> bool:
+    try:
+        return input(question).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -923,6 +1300,9 @@ def make_config(args: argparse.Namespace) -> Config:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     cfg = make_config(args)
+    if not args.dry_run and (curses is None or not sys.stdin.isatty() or not sys.stdout.isatty()):
+        print("reclaim: the picker needs a terminal; use --dry-run for a report", file=sys.stderr)
+        return 2
     progress = Progress(enabled=sys.stderr.isatty() and not args.json)
     try:
         cats, warnings = scan(cfg, progress)
@@ -930,15 +1310,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         progress.done()
         return 130
     progress.done()
+
     if args.json:
         json.dump(report_json(cats, warnings), sys.stdout, indent=2)
         print()
         return 0
-    print_report(cats, args.limit)
+    if args.dry_run:
+        print_report(cats, args.limit)
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        return 0
+
+    if DENIED.no_permission and not IS_ROOT:
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        if ask("Re-run with sudo to include them? [y/N] "):
+            rest = sys.argv[1:] if argv is None else list(argv)
+            os.execvp("sudo", ["sudo", sys.executable, os.path.realpath(__file__)] + rest)
+    if not cats:
+        print("nothing found to reclaim")
+        return 0
+    try:
+        log = run_tui(cats, cfg)
+    except KeyboardInterrupt:
+        return 130
+    if log:
+        print_log(log)
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
-    if not args.dry_run:
-        print("\nreclaim: the interactive picker isn't built yet; this was a report only.", file=sys.stderr)
     return 0
 
 

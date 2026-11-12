@@ -311,6 +311,39 @@ class DeleteTests(Base):
         self.assertEqual(run.calls, [["sudo", "-u", "alice", "-H", "--", "/fake/go", "clean", "-cache"]])
 
 
+class SelectionTests(unittest.TestCase):
+    def items(self):
+        return [r.Item("stale", 1, r.PRESELECT), r.Item("recent", 1, r.OPTIONAL),
+                r.Item("check", 1, r.REVIEW), r.Item("busy", 1, r.PROTECTED)]
+
+    def picked(self, items):
+        return [i.label for i in items if i.selected]
+
+    def test_category_toggle_skips_review_and_protected(self):
+        cat = r.Category("c", "t", "h", self.items())
+        self.assertEqual(r.toggle_category(cat), "")
+        self.assertEqual(self.picked(cat.items), ["stale", "recent"])
+        cat.items[2].selected = True              # picked by hand inside the category
+        r.toggle_category(cat)                    # all safe ones on -> clears everything
+        self.assertEqual(self.picked(cat.items), [])
+
+    def test_category_of_only_review_items_explains(self):
+        cat = r.Category("c", "t", "h", [r.Item("check", 1, r.REVIEW)])
+        self.assertIn("one by one", r.toggle_category(cat))
+        self.assertEqual(self.picked(cat.items), [])
+
+    def test_select_all_inside_category_includes_review(self):
+        items = self.items()
+        r.toggle_items(items, include_review=True)
+        self.assertEqual(self.picked(items), ["stale", "recent", "check"])
+        r.toggle_items(items, include_review=True)
+        self.assertEqual(self.picked(items), [])
+
+    def test_fit_keeps_the_end(self):
+        self.assertEqual(r.fit("/a/very/long/path/.terraform", 12), "…/.terraform")
+        self.assertEqual(r.fit("short", 12), "short")
+
+
 class CliTests(Base):
     def test_arg_validation(self):
         for argv in (["--json"], ["--dry-run", "--limit", "-1"], ["--big-file-gb", "0"]):
